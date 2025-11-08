@@ -4,11 +4,16 @@ temp_chunks/
 *.mp3
 *.m4a
 *.flac
-*.txt
 
 # Результаты транскрипции
 *_transcript.txt
 *_transcript.json
+lecture_transcript_*.txt
+
+# Исключения для важных файлов
+!requirements.txt
+!README.md
+!RESOURCES.md
 
 # Python
 __pycache__/
