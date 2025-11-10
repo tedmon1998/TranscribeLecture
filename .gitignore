@@ -10,10 +10,21 @@ temp_chunks/
 *_transcript.json
 lecture_transcript_*.txt
 
-# Исключения для важных файлов
+# Исключения для важных файплов
 !requirements.txt
 !README.md
 !RESOURCES.md
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+
+# Логи
+*.log
+server.log
+frontend.log
 
 # Python
 __pycache__/

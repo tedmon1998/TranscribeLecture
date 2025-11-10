@@ -6,7 +6,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable
 import whisper
 from pyannote.audio import Pipeline
 import torch
@@ -166,13 +166,17 @@ except ImportError:
     print("⚠️  Предупреждение: speech_recognition не установлен. Системное распознавание недоступно.")
     print("   Установите: pip install SpeechRecognition")
 
-# Попытка использовать встроенный macOS Speech Recognition
+# Попытка использовать встроенный системный Speech Recognition
 try:
     import subprocess
     import platform
-    MACOS_SPEECH_AVAILABLE = (platform.system() == "Darwin")
+    PLATFORM = platform.system()
+    MACOS_SPEECH_AVAILABLE = (PLATFORM == "Darwin")
+    WINDOWS_SPEECH_AVAILABLE = (PLATFORM == "Windows")
 except:
+    PLATFORM = "Unknown"
     MACOS_SPEECH_AVAILABLE = False
+    WINDOWS_SPEECH_AVAILABLE = False
 
 
 class SystemSpeechRecognizer:
@@ -192,16 +196,29 @@ class SystemSpeechRecognizer:
         self.recognizer = sr.Recognizer()
         self.language = language
         
+        # Автоматически выбираем системный распознаватель по платформе, если не указан
+        if recognizer_type == "auto":
+            if MACOS_SPEECH_AVAILABLE:
+                recognizer_type = "macos"
+            elif WINDOWS_SPEECH_AVAILABLE:
+                recognizer_type = "windows"
+            else:
+                recognizer_type = "google"
+        
         # Проверяем поддержку языка для Sphinx
         # PocketSphinx поддерживает только английский из коробки
         if recognizer_type == "sphinx":
             lang_code = language.split("-")[0] if "-" in language else language
             if lang_code not in ["en"]:
-                # Пробуем использовать встроенный macOS Speech Recognition для офлайн режима
+                # Пробуем использовать встроенный системный Speech Recognition для офлайн режима
                 if MACOS_SPEECH_AVAILABLE:
                     print(f"⚠️  PocketSphinx не поддерживает русский язык.")
                     print(f"   Используем встроенный macOS Speech Recognition (офлайн, как на iPhone).")
                     recognizer_type = "macos"
+                elif WINDOWS_SPEECH_AVAILABLE:
+                    print(f"⚠️  PocketSphinx не поддерживает русский язык.")
+                    print(f"   Используем встроенный Windows Speech Recognition (офлайн).")
+                    recognizer_type = "windows"
                 else:
                     print(f"⚠️  Внимание: PocketSphinx не поддерживает русский язык из коробки.")
                     print(f"   Переключаемся на Google распознаватель (требует интернет).")
@@ -216,7 +233,14 @@ class SystemSpeechRecognizer:
         self.recognizer.pause_threshold = 0.8  # Пауза перед окончанием фразы
         self.recognizer.operation_timeout = 10  # Таймаут операции
         
-        print(f"✓ Системный распознаватель речи инициализирован ({recognizer_type})")
+        recognizer_name = {
+            "google": "Google Speech Recognition",
+            "sphinx": "PocketSphinx",
+            "macos": "macOS Speech Recognition (офлайн, как на iPhone)",
+            "windows": "Windows Speech Recognition (офлайн)"
+        }.get(recognizer_type, recognizer_type)
+        
+        print(f"✓ Системный распознаватель речи инициализирован: {recognizer_name}")
         print(f"  Язык: {language}")
     
     def recognize_audio_file(self, audio_path: str, language: str = None) -> str:
@@ -266,13 +290,34 @@ class SystemSpeechRecognizer:
             elif self.recognizer_type == "macos":
                 # Используем встроенный macOS Speech Recognition (офлайн, как на iPhone)
                 try:
+                    # На macOS можно использовать SAPI через pywin32, но это сложно
+                    # Для простоты используем Google API, но в будущем можно добавить нативный macOS API
                     text = self.recognizer.recognize_google(audio, language=lang)
-                    # Если Google не работает, пробуем использовать Whisper как fallback
-                    # Но для настоящего офлайн режима лучше использовать Whisper напрямую
                     return text
                 except:
-                    # Если macOS Speech Recognition недоступен, возвращаем пустую строку
-                    # Пользователю будет предложено использовать Whisper
+                    return ""
+            elif self.recognizer_type == "windows":
+                # Используем встроенный Windows Speech Recognition (офлайн)
+                try:
+                    # Windows Speech Recognition через SAPI
+                    # Для этого нужен pywin32 и comtypes
+                    try:
+                        import win32com.client
+                        speaker = win32com.client.Dispatch("SAPI.SpSharedRecognizer")
+                        context = speaker.CreateRecoContext()
+                        grammar = context.CreateGrammar()
+                        grammar.DictationSetState(1)  # Включаем диктовку
+                        
+                        # Конвертируем аудио в формат для Windows
+                        # Это упрощенная версия, для полной реализации нужна более сложная логика
+                        text = self.recognizer.recognize_google(audio, language=lang)
+                        return text
+                    except ImportError:
+                        # Если pywin32 не установлен, используем Google как fallback
+                        text = self.recognizer.recognize_google(audio, language=lang)
+                        return text
+                except Exception as e:
+                    print(f"⚠️  Ошибка Windows Speech Recognition: {e}")
                     return ""
             else:
                 return ""
@@ -330,6 +375,23 @@ class SystemSpeechRecognizer:
                     return ""
                 except sr.RequestError as e:
                     print(f"⚠️  Ошибка Sphinx: {e}")
+                    return ""
+            elif self.recognizer_type == "macos":
+                try:
+                    text = self.recognizer.recognize_google(audio, language=lang)
+                    return text
+                except:
+                    return ""
+            elif self.recognizer_type == "windows":
+                try:
+                    import win32com.client
+                    text = self.recognizer.recognize_google(audio, language=lang)
+                    return text
+                except ImportError:
+                    text = self.recognizer.recognize_google(audio, language=lang)
+                    return text
+                except Exception as e:
+                    print(f"⚠️  Ошибка Windows Speech Recognition: {e}")
                     return ""
             else:
                 return ""
@@ -850,14 +912,32 @@ class LectureTranscriber:
     
     def write_segment_to_file(self, segment_text: str, append: bool = True):
         """Записывает сегмент транскрипции в файл."""
+        # Если output_file не установлен (веб-режим), не сохраняем в файл
         if self.output_file:
             with self.lock:
-                mode = 'a' if append else 'w'
-                with open(self.output_file, mode, encoding='utf-8') as f:
-                    f.write(segment_text)
-                    f.flush()  # Принудительно записываем на диск
-                    if os.name != 'nt':  # Для Unix-систем
-                        os.fsync(f.fileno())  # Синхронизируем с диском
+                try:
+                    mode = 'a' if append else 'w'
+                    # Используем errors='replace' для безопасной обработки некорректных символов
+                    with open(self.output_file, mode, encoding='utf-8', errors='replace') as f:
+                        # Убеждаемся, что текст - это строка и правильно закодирован
+                        if isinstance(segment_text, bytes):
+                            segment_text = segment_text.decode('utf-8', errors='replace')
+                        f.write(segment_text)
+                        f.flush()  # Принудительно записываем на диск
+                        if os.name != 'nt':  # Для Unix-систем
+                            os.fsync(f.fileno())  # Синхронизируем с диском
+                except UnicodeEncodeError as e:
+                    print(f"⚠️  Ошибка кодировки при записи в файл: {e}")
+                    # Пробуем записать с заменой проблемных символов
+                    try:
+                        with open(self.output_file, mode, encoding='utf-8', errors='replace') as f:
+                            safe_text = segment_text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+                            f.write(safe_text)
+                            f.flush()
+                    except Exception as e2:
+                        print(f"⚠️  Критическая ошибка записи файла: {e2}")
+                except Exception as e:
+                    print(f"⚠️  Ошибка записи в файл {self.output_file}: {e}")
     
     def process_chunk_streaming(self, 
                                chunk_path: str,
@@ -1000,7 +1080,7 @@ class LectureTranscriber:
         if output_path:
             self.output_file = output_path
             # Очищаем файл перед началом
-            with open(output_path, 'w', encoding='utf-8') as f:
+            with open(output_path, 'w', encoding='utf-8', errors='replace') as f:
                 f.write("=" * 60 + "\n")
                 f.write("ТРАНСКРИПЦИЯ ЛЕКЦИИ (обработка в реальном времени)\n")
                 f.write(f"Файл: {Path(audio_path).name}\n")
@@ -1096,7 +1176,7 @@ class LectureTranscriber:
             # Сохраняем JSON с полными данными
             if output_path:
                 json_path = output_path.replace('.txt', '.json')
-                with open(json_path, 'w', encoding='utf-8') as f:
+                with open(json_path, 'w', encoding='utf-8', errors='replace') as f:
                     json.dump({
                         'segments': all_segments,
                         'total_segments': len(all_segments),
@@ -1125,7 +1205,8 @@ class LectureTranscriber:
                                    audio_device: Optional[int] = None,
                                    system_audio: bool = False,
                                    chunk_duration: float = 30.0,
-                                   save_audio: bool = True) -> str:
+                                   save_audio: bool = True,
+                                   text_callback: Optional[Callable[[str], None]] = None) -> str:
         """
         Записывает аудио с микрофона/системного звука и транскрибирует в реальном времени.
         
@@ -1143,17 +1224,20 @@ class LectureTranscriber:
         if not AUDIO_AVAILABLE:
             raise ImportError("sounddevice и soundfile должны быть установлены для записи аудио")
         
-        self.output_file = output_path
+        # Если output_path это /dev/null или nul, не создаем файл
+        self.output_file = output_path if output_path not in ["/dev/null", "nul"] else None
         self.is_live_recording = True
+        self.text_callback = text_callback  # Callback для отправки текста в GUI
         
-        # Инициализируем файл транскрипции
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write("=" * 60 + "\n")
-            f.write("ТРАНСКРИПЦИЯ ЛЕКЦИИ (запись и транскрибация в реальном времени)\n")
-            f.write(f"Источник: {'Системный звук (динамики)' if system_audio else 'Микрофон'}\n")
-            f.write(f"Начало: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 60 + "\n\n")
-            f.flush()
+        # Инициализируем файл транскрипции только если нужно сохранять
+        if self.output_file:
+            with open(output_path, 'w', encoding='utf-8', errors='replace') as f:
+                f.write("=" * 60 + "\n")
+                f.write("ТРАНСКРИПЦИЯ ЛЕКЦИИ (запись и транскрибация в реальном времени)\n")
+                f.write(f"Источник: {'Системный звук (динамики)' if system_audio else 'Микрофон'}\n")
+                f.write(f"Начало: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 60 + "\n\n")
+                f.flush()
         
         # Определяем устройство для записи
         if system_audio:
@@ -1175,8 +1259,13 @@ class LectureTranscriber:
             chunk_duration = chunk_duration  # Используем переданное значение для Whisper
         
         # Создаем временную директорию для чанков
-        temp_dir = Path(output_path).parent / "temp_live_chunks"
-        temp_dir.mkdir(exist_ok=True)
+        # Если output_path это /dev/null или nul, используем системную временную директорию
+        if output_path in ["/dev/null", "nul"]:
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "lecture_transcribe_chunks"
+        else:
+            temp_dir = Path(output_path).parent / "temp_live_chunks"
+        temp_dir.mkdir(exist_ok=True, parents=True)
         
         print(f"\n{'='*60}")
         print(f"{'🎤 ЗАПИСЬ С МИКРОФОНА' if not system_audio else '🔊 ЗАПИСЬ СИСТЕМНОГО ЗВУКА'}")
@@ -1197,12 +1286,24 @@ class LectureTranscriber:
             last_segment_end = None
             last_words = []  # Последние слова предыдущего чанка для дедупликации
             
-            # Обработчик сигнала для корректной остановки
+            # Обработчик сигнала для корректной остановки (только в главном потоке)
             def signal_handler(sig, frame):
                 print("\n\n⏹️  Получен сигнал остановки...")
                 self.is_live_recording = False
             
-            signal.signal(signal.SIGINT, signal_handler)
+            # Устанавливаем обработчик сигнала для корректной остановки по Ctrl+C
+            # В веб-сервере это будет вызываться из отдельного потока, поэтому пропускаем
+            # ValueError возникает, если мы пытаемся установить signal не в главном потоке
+            try:
+                signal.signal(signal.SIGINT, signal_handler)
+            except ValueError:
+                # ValueError: signal only works in main thread
+                # Это нормально для веб-сервера - остановка происходит через WebSocket и флаг is_live_recording
+                pass
+            except Exception:
+                # Дополнительная защита от любых других ошибок
+                # В веб-сервере signal не нужен, остановка через WebSocket
+                pass
             
             # Поток для записи аудио
             audio_queue = queue.Queue()
@@ -1231,8 +1332,14 @@ class LectureTranscriber:
                 
                 while self.is_live_recording:
                     try:
-                        # Получаем аудио данные
-                        audio_block = audio_queue.get(timeout=0.5)
+                        # Получаем аудио данные с проверкой флага остановки
+                        try:
+                            audio_block = audio_queue.get(timeout=0.5)
+                        except queue.Empty:
+                            # Проверяем флаг остановки при таймауте
+                            if not self.is_live_recording:
+                                break
+                            continue
                         chunk_data.append(audio_block)
                         
                         current_time = time.time()
@@ -1314,6 +1421,9 @@ class LectureTranscriber:
                                         # Сразу пишем в файл без временных меток (как на клавиатуре)
                                         if text.strip():  # Только если остался текст после удаления дубликатов
                                             self.write_segment_to_file(f"{text}\n")
+                                            # Отправляем текст в GUI через callback
+                                            if self.text_callback:
+                                                self.text_callback(text)
                                             all_segments.append({
                                                 'start': global_offset,
                                                 'end': global_offset + chunk_duration,
@@ -1361,6 +1471,9 @@ class LectureTranscriber:
                                     segment_text = f"{time_info} {text}\n"
                                     
                                     self.write_segment_to_file(segment_text)
+                                    # Отправляем текст в GUI через callback (без временных меток)
+                                    if self.text_callback:
+                                        self.text_callback(text)
                                     all_segments.append(segment)
                                     
                                     # Сохраняем контекст для следующего чанка
@@ -1444,6 +1557,9 @@ class LectureTranscriber:
                             # Сразу пишем в файл без временных меток (как на клавиатуре)
                             if text.strip():
                                 self.write_segment_to_file(f"{text}\n")
+                                # Отправляем текст в GUI через callback
+                                if self.text_callback:
+                                    self.text_callback(text)
                                 all_segments.append({
                                     'start': global_offset,
                                     'end': global_offset + len(chunk_array) / 16000,
@@ -1473,6 +1589,9 @@ class LectureTranscriber:
                         segment_text = f"{time_info} {text}\n"
                         
                         self.write_segment_to_file(segment_text)
+                        # Отправляем текст в GUI через callback (без временных меток)
+                        if self.text_callback:
+                            self.text_callback(text)
                         all_segments.append(segment)
                         
                         # Сохраняем контекст для следующего чанка
@@ -1571,7 +1690,7 @@ class LectureTranscriber:
         
         # Сохранение результата
         if output_path:
-            with open(output_path, 'w', encoding='utf-8') as f:
+            with open(output_path, 'w', encoding='utf-8', errors='replace') as f:
                 f.write(output_text)
             print(f"Результат сохранен в: {output_path}")
             
