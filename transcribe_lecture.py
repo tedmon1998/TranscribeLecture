@@ -179,6 +179,55 @@ except:
     WINDOWS_SPEECH_AVAILABLE = False
 
 
+def get_language_code(lang: str) -> str:
+    """
+    Конвертирует короткий код языка в полный формат для распознавания речи.
+    
+    Args:
+        lang: Короткий код языка (ru, en, de, и т.д.)
+    
+    Returns:
+        Полный код языка для распознавания (ru-RU, en-US, и т.д.)
+    """
+    lang_map = {
+        "ru": "ru-RU",
+        "en": "en-US",
+        "uk": "uk-UA",
+        "de": "de-DE",
+        "fr": "fr-FR",
+        "es": "es-ES",
+        "it": "it-IT",
+        "pt": "pt-PT",
+        "pl": "pl-PL",
+        "zh": "zh-CN",
+        "ja": "ja-JP",
+        "ko": "ko-KR",
+        "ar": "ar-SA",
+        "tr": "tr-TR",
+        "nl": "nl-NL",
+        "sv": "sv-SE",
+        "no": "no-NO",
+        "fi": "fi-FI",
+        "cs": "cs-CZ",
+        "hu": "hu-HU",
+        "ro": "ro-RO",
+        "bg": "bg-BG",
+        "hr": "hr-HR",
+        "sk": "sk-SK",
+        "sl": "sl-SI",
+        "sr": "sr-RS",
+        "el": "el-GR",
+        "he": "he-IL",
+        "hi": "hi-IN",
+        "th": "th-TH",
+        "vi": "vi-VN",
+        "id": "id-ID",
+        "ms": "ms-MY",
+        "tl": "tl-PH",
+    }
+    return lang_map.get(lang, "ru-RU")  # По умолчанию русский
+
+
 class SystemSpeechRecognizer:
     """Класс для системного распознавания речи (как на телефоне)."""
     
@@ -258,9 +307,7 @@ class SystemSpeechRecognizer:
             # Определяем язык для распознавания
             lang = language or self.language
             # Конвертируем короткий код языка в полный формат
-            lang_map = {"ru": "ru-RU", "en": "en-US", "uk": "uk-UA"}
-            if lang in lang_map:
-                lang = lang_map[lang]
+            lang = get_language_code(lang) if len(lang) <= 5 else lang
             
             with sr.AudioFile(audio_path) as source:
                 # Адаптируем к уровню шума
@@ -341,9 +388,7 @@ class SystemSpeechRecognizer:
             # Определяем язык для распознавания
             lang = language or self.language
             # Конвертируем короткий код языка в полный формат
-            lang_map = {"ru": "ru-RU", "en": "en-US", "uk": "uk-UA"}
-            if lang in lang_map:
-                lang = lang_map[lang]
+            lang = get_language_code(lang) if len(lang) <= 5 else lang
             
             # Конвертируем в формат для speech_recognition
             # Нормализуем до int16
@@ -1262,10 +1307,25 @@ class LectureTranscriber:
         # Если output_path это /dev/null или nul, используем системную временную директорию
         if output_path in ["/dev/null", "nul"]:
             import tempfile
-            temp_dir = Path(tempfile.gettempdir()) / "lecture_transcribe_chunks"
+            temp_base = Path(tempfile.gettempdir())
+            temp_dir = temp_base / "lecture_transcribe_chunks"
         else:
             temp_dir = Path(output_path).parent / "temp_live_chunks"
-        temp_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Создаем директорию с проверкой прав доступа
+        try:
+            temp_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+            # Проверяем, что можем писать в директорию
+            test_file = temp_dir / ".test_write"
+            test_file.touch()
+            test_file.unlink()
+        except (PermissionError, OSError) as e:
+            # Если не можем создать в temp, пробуем в текущей директории
+            temp_dir = Path.cwd() / "temp_live_chunks"
+            try:
+                temp_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+            except Exception:
+                raise Exception(f"Не удалось создать временную директорию: {e}")
         
         print(f"\n{'='*60}")
         print(f"{'🎤 ЗАПИСЬ С МИКРОФОНА' if not system_audio else '🔊 ЗАПИСЬ СИСТЕМНОГО ЗВУКА'}")
@@ -1317,18 +1377,39 @@ class LectureTranscriber:
             else:
                 print()  # Пустая строка для системного распознавателя
             
+            # Для ультра-быстрого режима используем меньший blocksize
+            blocksize_duration = 0.1 if (self.use_system_recognizer and chunk_duration <= 0.3) else 0.5
             with sd.InputStream(samplerate=16000,
                               channels=1,
                               device=device_id,
                               dtype='float32',
                               callback=audio_callback,
-                              blocksize=int(16000 * 0.5)):  # Блоки по 0.5 секунды
+                              blocksize=int(16000 * blocksize_duration)):  # Блоки по 0.1-0.5 секунды
                 
                 chunk_data = []
                 overlap_data = []  # Данные для перекрытия между чанками
                 chunk_start_time = time.time()
-                overlap_duration = 1.5  # Перекрытие 1.5 секунды для предотвращения потери слов
+                # Для ультра-быстрого режима используем меньшее перекрытие
+                if self.use_system_recognizer and chunk_duration <= 0.3:
+                    overlap_duration = 0.3  # Минимальное перекрытие для ультра-быстрого режима
+                else:
+                    overlap_duration = 1.5  # Перекрытие 1.5 секунды для предотвращения потери слов
                 overlap_samples = int(16000 * overlap_duration)  # Количество сэмплов для перекрытия
+                
+                # Режим реального времени для системного распознавателя (chunk_duration <= 1.0)
+                realtime_mode = self.use_system_recognizer and chunk_duration <= 1.0
+                if realtime_mode:
+                    # Для ультра-быстрого режима (<= 0.3 сек) используем очень маленький буфер
+                    # Для обычного реального времени (0.3-1.0 сек) используем буфер побольше
+                    if chunk_duration <= 0.3:
+                        # Ультра-быстрый режим: обрабатываем каждые 0.2-0.3 секунды
+                        realtime_buffer_duration = max(0.2, chunk_duration)
+                    else:
+                        # Обычный режим реального времени: буфер 0.5-1 секунда
+                        realtime_buffer_duration = min(1.0, chunk_duration * 1.5)
+                    realtime_buffer_samples = int(16000 * realtime_buffer_duration)
+                    realtime_buffer = []
+                    realtime_last_process = time.time()
                 
                 while self.is_live_recording:
                     try:
@@ -1340,16 +1421,87 @@ class LectureTranscriber:
                             if not self.is_live_recording:
                                 break
                             continue
-                        chunk_data.append(audio_block)
                         
                         current_time = time.time()
+                        
+                        # Режим реального времени для системного распознавателя
+                        if realtime_mode:
+                            realtime_buffer.append(audio_block)
+                            buffer_samples = sum(len(block) for block in realtime_buffer)
+                            
+                            # Обрабатываем каждую секунду или когда буфер достаточно большой
+                            elapsed_since_process = current_time - realtime_last_process
+                            if elapsed_since_process >= realtime_buffer_duration or buffer_samples >= realtime_buffer_samples:
+                                if len(realtime_buffer) > 0:
+                                    # Объединяем буфер
+                                    buffer_array = np.concatenate(realtime_buffer, axis=0)
+                                    if len(buffer_array.shape) == 1:
+                                        buffer_array = buffer_array.reshape(-1, 1)
+                                    
+                                    # Добавляем перекрытие если есть
+                                    if len(overlap_data) > 0:
+                                        overlap_array = np.concatenate(overlap_data, axis=0)
+                                        buffer_array = np.concatenate([overlap_array, buffer_array], axis=0)
+                                    
+                                    # Сохраняем последние данные для перекрытия
+                                    total_samples = len(buffer_array)
+                                    if total_samples > overlap_samples:
+                                        overlap_start_idx = total_samples - overlap_samples
+                                        overlap_data = [buffer_array[overlap_start_idx:]]
+                                    else:
+                                        overlap_data = [buffer_array]
+                                    
+                                    # Распознаем сразу из буфера
+                                    system_lang = get_language_code(language)
+                                    text = self.system_recognizer.recognize_audio_data(buffer_array, sample_rate=16000, language=system_lang)
+                                    
+                                    if text:
+                                        # Удаляем дубликаты
+                                        words = text.split()
+                                        if len(last_words) > 0 and len(words) > 0:
+                                            check_len = min(5, len(last_words), len(words))
+                                            if check_len > 0:
+                                                last_words_check = last_words[-check_len:]
+                                                first_words_check = words[:check_len]
+                                                
+                                                if last_words_check == first_words_check:
+                                                    words = words[check_len:]
+                                                elif check_len >= 3:
+                                                    for i in range(2, check_len + 1):
+                                                        if last_words[-i:] == words[:i]:
+                                                            words = words[i:]
+                                                            break
+                                        
+                                        if len(words) > 0:
+                                            last_words = words[-5:]
+                                            text = ' '.join(words)
+                                            
+                                            if text.strip():
+                                                self.write_segment_to_file(f"{text}\n")
+                                                if self.text_callback:
+                                                    self.text_callback(text)
+                                    
+                                    # Очищаем буфер
+                                    realtime_buffer = []
+                                    realtime_last_process = current_time
+                            
+                            continue  # Пропускаем обычную обработку чанков
+                        
+                        # Обычный режим (накопление чанков)
+                        chunk_data.append(audio_block)
                         elapsed = current_time - chunk_start_time
                         
                         # Когда накопили достаточно данных для чанка
                         if elapsed >= chunk_duration:
                             # Сохраняем чанк
                             chunk_path = temp_dir / f"chunk_{chunk_counter:04d}.wav"
-                            chunk_array = np.concatenate(chunk_data, axis=0)
+                            try:
+                                chunk_array = np.concatenate(chunk_data, axis=0)
+                            except Exception as e:
+                                print(f"\n⚠️  Ошибка объединения аудио данных: {e}")
+                                chunk_data = []
+                                chunk_start_time = current_time
+                                continue
                             
                             # Добавляем перекрытие с предыдущим чанком (если есть)
                             if len(overlap_data) > 0:
@@ -1363,7 +1515,25 @@ class LectureTranscriber:
                                 chunk_array = chunk_array.reshape(-1, 1)
                             
                             try:
+                                # Убеждаемся, что директория существует и доступна для записи
+                                if not temp_dir.exists():
+                                    temp_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
                                 sf.write(str(chunk_path), chunk_array, 16000, subtype='PCM_16')
+                            except (PermissionError, OSError) as e:
+                                print(f"\n⚠️  Ошибка записи чанка {chunk_counter}: {e}")
+                                # Пробуем альтернативную директорию
+                                try:
+                                    import tempfile
+                                    alt_temp_dir = Path(tempfile.gettempdir()) / f"lecture_chunks_{os.getpid()}"
+                                    alt_temp_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+                                    temp_dir = alt_temp_dir
+                                    chunk_path = temp_dir / f"chunk_{chunk_counter:04d}.wav"
+                                    sf.write(str(chunk_path), chunk_array, 16000, subtype='PCM_16')
+                                except Exception as e2:
+                                    print(f"⚠️  Не удалось записать в альтернативную директорию: {e2}")
+                                    chunk_data = []
+                                    chunk_start_time = current_time
+                                    continue
                             except Exception as e:
                                 print(f"\n⚠️  Ошибка записи чанка {chunk_counter}: {e}")
                                 # Пропускаем этот чанк и продолжаем
@@ -1388,8 +1558,7 @@ class LectureTranscriber:
                             if self.use_system_recognizer:
                                 # Используем системный распознаватель (как на клавиатуре телефона)
                                 # Без прогресс-баров, сразу пишем в файл
-                                lang_map = {"ru": "ru-RU", "en": "en-US", "uk": "uk-UA"}
-                                system_lang = lang_map.get(language, "ru-RU")
+                                system_lang = get_language_code(language)
                                 text = self.system_recognizer.recognize_audio_file(str(chunk_path), language=system_lang)
                                 
                                 if text:
@@ -1528,8 +1697,7 @@ class LectureTranscriber:
                 
                 if self.use_system_recognizer:
                     # Используем системный распознаватель (без сообщений, сразу пишем)
-                    lang_map = {"ru": "ru-RU", "en": "en-US", "uk": "uk-UA"}
-                    system_lang = lang_map.get(language, "ru-RU")
+                    system_lang = get_language_code(language)
                     text = self.system_recognizer.recognize_audio_file(str(chunk_path), language=system_lang)
                     
                     if text:

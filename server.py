@@ -19,6 +19,14 @@ from pathlib import Path
 
 from transcribe_lecture import LectureTranscriber, AudioRecorder, SYSTEM_RECOGNIZER_AVAILABLE, AUDIO_AVAILABLE
 
+# Импорт для перевода
+try:
+    from deep_translator import GoogleTranslator
+    TRANSLATOR_AVAILABLE = True
+except ImportError:
+    TRANSLATOR_AVAILABLE = False
+    GoogleTranslator = None
+
 app = FastAPI(title="Транскрибатор лекций")
 
 # CORS для фронтенда
@@ -117,11 +125,44 @@ async def send_websocket_message(websocket: WebSocket, message: dict):
             print(f"⚠️  Ошибка отправки WebSocket сообщения: {e}")
 
 
+def translate_text(text: str, target_lang: str, source_lang: str = "auto") -> str:
+    """
+    Переводит текст на целевой язык.
+    
+    Args:
+        text: Текст для перевода
+        target_lang: Целевой язык (ru, en, и т.д.)
+        source_lang: Исходный язык (auto для автоопределения)
+    
+    Returns:
+        Переведенный текст или оригинал при ошибке
+    """
+    if not TRANSLATOR_AVAILABLE or not text or not text.strip():
+        return text
+    
+    try:
+        # Используем deep-translator (более стабильная библиотека)
+        if source_lang == "auto":
+            # Автоопределение языка
+            translator = GoogleTranslator(source='auto', target=target_lang)
+        else:
+            translator = GoogleTranslator(source=source_lang, target=target_lang)
+        
+        result = translator.translate(text)
+        return result
+    except Exception as e:
+        # При ошибке возвращаем оригинал
+        return text
+
+
 def transcription_worker(
     session_id: str,
     method: str,
     source: str,
     language: str,
+    chunk_duration: float,
+    enable_translation: bool,
+    target_language: str,
     websocket: WebSocket,
     loop: asyncio.AbstractEventLoop
 ):
@@ -160,12 +201,31 @@ def transcription_worker(
         
         # НЕ создаем файл - сохраняем только в память, файл будет создан по запросу
         # Состояние для логических переносов и накопления текста
-        full_text_state = {"full": "", "pending": ""}
-        accumulated_text = []  # Список для накопления текста
+        # Используем словарь для хранения состояния, чтобы можно было сбрасывать извне
+        session_state = active_transcribers.get(session_id, {})
+        if "full_text_state" not in session_state:
+            session_state["full_text_state"] = {"full": "", "pending": ""}
+            session_state["translated_text_state"] = {"full": "", "pending": ""}
+            session_state["accumulated_text"] = []
+        
+        full_text_state = session_state["full_text_state"]
+        translated_text_state = session_state["translated_text_state"]
+        accumulated_text = session_state["accumulated_text"]
         
         def text_callback(text: str):
             """Callback для получения нового текста."""
             try:
+                # Проверяем, была ли очистка - если да, сбрасываем состояние
+                session_state = active_transcribers.get(session_id, {})
+                if session_state.get("text_cleared", False):
+                    # Сбрасываем состояние и убираем флаг
+                    full_text_state["full"] = ""
+                    full_text_state["pending"] = ""
+                    translated_text_state["full"] = ""
+                    translated_text_state["pending"] = ""
+                    accumulated_text.clear()
+                    session_state["text_cleared"] = False
+                
                 # Убеждаемся, что текст - это строка и правильно закодирован
                 if isinstance(text, bytes):
                     text = text.decode('utf-8', errors='replace')
@@ -203,21 +263,70 @@ def transcription_worker(
                 # Сохраняем текст в память
                 accumulated_text.append(text)
                 
-                # Отправляем через WebSocket (используем event loop)
-                # Проверяем, что WebSocket еще открыт
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        send_websocket_message(websocket, {
+                # Отправляем оригинал сразу (в реальном времени)
+                # Проверяем, есть ли активное WebSocket соединение
+                session_state = active_transcribers.get(session_id, {})
+                current_websocket = session_state.get("websocket")
+                
+                if current_websocket:
+                    try:
+                        message = {
                             "type": "text",
                             "text": formatted,  # Полный накопленный текст с логическими переносами
                             "new_text": text  # Только новый кусок текста
-                        }),
-                        loop
-                    )
-                    # Не ждем результата, чтобы не блокировать
-                except Exception as ws_error:
-                    # Игнорируем ошибки, если WebSocket закрыт
-                    pass
+                        }
+                        
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_websocket_message(current_websocket, message),
+                            loop
+                        )
+                        # Не ждем результата, чтобы не блокировать
+                    except Exception as ws_error:
+                        # Игнорируем ошибки, если WebSocket закрыт
+                        pass
+                
+                # Переводим текст асинхронно (с задержкой), если включен перевод
+                if enable_translation and target_language and target_language != language:
+                    def translate_async():
+                        """Асинхронный перевод в отдельном потоке."""
+                        try:
+                            # Переводим только новый текст для скорости
+                            translated_new_text = translate_text(text, target_language, language)
+                            if translated_new_text and translated_new_text.strip():
+                                # Применяем логические переносы к переводу
+                                translated_formatted, translated_new_pending = add_logical_line_breaks(
+                                    translated_new_text,
+                                    translated_text_state["full"],
+                                    translated_text_state["pending"]
+                                )
+                                # Обновляем состояние перевода
+                                if translated_new_pending and translated_formatted.endswith(translated_new_pending):
+                                    translated_text_state["full"] = translated_formatted[:-len(translated_new_pending)].rstrip()
+                                else:
+                                    translated_text_state["full"] = translated_formatted
+                                translated_text_state["pending"] = translated_new_pending
+                                
+                                # Отправляем перевод через WebSocket
+                                session_state = active_transcribers.get(session_id, {})
+                                current_websocket = session_state.get("websocket")
+                                if current_websocket:
+                                    try:
+                                        translate_message = {
+                                            "type": "translated_text",
+                                            "translated_text": translated_formatted
+                                        }
+                                        asyncio.run_coroutine_threadsafe(
+                                            send_websocket_message(current_websocket, translate_message),
+                                            loop
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            # Игнорируем ошибки перевода
+                            pass
+                    
+                    # Запускаем перевод в отдельном потоке (не блокирует основной поток)
+                    threading.Thread(target=translate_async, daemon=True).start()
             except UnicodeDecodeError as e:
                 # Пробуем обработать текст с заменой проблемных символов
                 try:
@@ -249,7 +358,7 @@ def transcription_worker(
                 output_path=temp_output,
                 language=language,
                 system_audio=system_audio,
-                chunk_duration=5.0 if use_system else 30.0,
+                chunk_duration=chunk_duration,
                 text_callback=text_callback
             )
         except Exception as e:
@@ -296,9 +405,10 @@ def transcription_worker(
         except:
             pass
     finally:
-        # Удаляем из активных транскриберов
-        if session_id in active_transcribers:
-            del active_transcribers[session_id]
+        # НЕ удаляем сессию автоматически - она будет удалена только при явной остановке
+        # Это позволяет переподключаться и восстанавливать состояние
+        # Сессия удаляется только в websocket_transcribe при получении сообщения "stop"
+        pass
 
 
 @app.get("/")
@@ -331,6 +441,31 @@ async def list_devices():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/session/{session_id}/status")
+async def get_session_status(session_id: str):
+    """Получить статус сессии и текущий текст."""
+    if session_id not in active_transcribers:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session_state = active_transcribers[session_id]
+    transcriber = session_state.get("transcriber")
+    
+    # Получаем текущий текст
+    full_text_state = session_state.get("full_text_state", {"full": "", "pending": ""})
+    translated_text_state = session_state.get("translated_text_state", {"full": "", "pending": ""})
+    
+    current_text = full_text_state.get("full", "") + (full_text_state.get("pending", "") if full_text_state.get("pending") else "")
+    current_translated = translated_text_state.get("full", "") + (translated_text_state.get("pending", "") if translated_text_state.get("pending") else "")
+    
+    return {
+        "session_id": session_id,
+        "is_recording": transcriber.is_live_recording if transcriber else False,
+        "has_websocket": session_state.get("websocket") is not None,
+        "text": current_text,
+        "translated_text": current_translated if session_state.get("enable_translation") else ""
+    }
+
+
 @app.websocket("/ws/transcribe/{session_id}")
 async def websocket_transcribe(websocket: WebSocket, session_id: str):
     """WebSocket endpoint для транскрибации в реальном времени."""
@@ -344,6 +479,23 @@ async def websocket_transcribe(websocket: WebSocket, session_id: str):
         recognizer_type = data.get("recognizer_type", "google")
         source = data.get("source", "microphone")
         language = data.get("language", "ru")
+        chunk_duration = float(data.get("chunk_duration", 0.2 if method == "system_recognizer" else 30.0))
+        enable_translation = data.get("enable_translation", False)
+        target_language = data.get("target_language", "en")
+        
+        # Валидация chunk_duration
+        if method == "system_recognizer":
+            # Для системного распознавателя разрешаем от 0.1 до 10 секунд (0.1 для ультра-быстрого режима)
+            if chunk_duration < 0.1:
+                chunk_duration = 0.1
+            elif chunk_duration > 10.0:
+                chunk_duration = 10.0
+        else:
+            # Для Whisper от 1 до 60 секунд
+            if chunk_duration < 1.0:
+                chunk_duration = 1.0
+            elif chunk_duration > 60.0:
+                chunk_duration = 60.0
         
         # Проверяем доступность
         if not AUDIO_AVAILABLE:
@@ -366,33 +518,64 @@ async def websocket_transcribe(websocket: WebSocket, session_id: str):
             "method": method,
             "recognizer_type": recognizer_type,
             "source": source,
-            "language": language
+            "language": language,
+            "chunk_duration": chunk_duration,
+            "enable_translation": enable_translation,
+            "target_language": target_language
         }
         
-        # Отправляем подтверждение
-        await websocket.send_json({
-            "type": "started",
-            "session_id": session_id
-        })
+        # Проверяем, существует ли уже сессия (переподключение)
+        is_reconnect = session_id in active_transcribers and active_transcribers[session_id].get("transcriber") is not None
+        
+        if is_reconnect:
+            # Переподключение - отправляем текущее состояние
+            session_state = active_transcribers[session_id]
+            full_text_state = session_state.get("full_text_state", {"full": "", "pending": ""})
+            translated_text_state = session_state.get("translated_text_state", {"full": "", "pending": ""})
+            
+            current_text = full_text_state.get("full", "") + (full_text_state.get("pending", "") if full_text_state.get("pending") else "")
+            current_translated = translated_text_state.get("full", "") + (translated_text_state.get("pending", "") if translated_text_state.get("pending") else "")
+            
+            # Обновляем WebSocket в сессии
+            active_transcribers[session_id]["websocket"] = websocket
+            
+            await websocket.send_json({
+                "type": "reconnected",
+                "session_id": session_id,
+                "text": current_text,
+                "translated_text": current_translated if enable_translation else ""
+            })
+        else:
+            # Новая сессия
+            await websocket.send_json({
+                "type": "started",
+                "session_id": session_id
+            })
         
         # Получаем event loop для использования в worker потоке
         loop = asyncio.get_event_loop()
         
-        # Запускаем транскрибацию в отдельном потоке
-        thread = threading.Thread(
-            target=transcription_worker,
-            args=(session_id, method, source, language, websocket, loop),
-            daemon=True
-        )
-        thread.start()
+        # Запускаем транскрибацию только если она еще не запущена (не переподключение)
+        if not is_reconnect:
+            # Запускаем транскрибацию в отдельном потоке
+            thread = threading.Thread(
+                target=transcription_worker,
+                args=(session_id, method, source, language, chunk_duration, enable_translation, target_language, websocket, loop),
+                daemon=True
+            )
+            thread.start()
         
         # Ждем сообщений от клиента (для остановки)
         while True:
             try:
                 # Используем timeout, чтобы периодически проверять состояние
                 try:
-                    message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
-                    if message.get("type") == "stop":
+                    message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+                    if message.get("type") == "ping":
+                        # Отвечаем на ping для поддержания соединения
+                        await websocket.send_json({"type": "pong"})
+                        continue
+                    elif message.get("type") == "stop":
                         # Останавливаем транскрибацию
                         print(f"Получен запрос на остановку для сессии {session_id}")
                         if session_id in active_transcribers:
@@ -400,13 +583,35 @@ async def websocket_transcribe(websocket: WebSocket, session_id: str):
                             if transcriber:
                                 print(f"Останавливаем транскрибацию...")
                                 transcriber.is_live_recording = False
+                            # Удаляем сессию только при явной остановке
+                            del active_transcribers[session_id]
                         # Отправляем подтверждение остановки
                         await websocket.send_json({
                             "type": "stopped",
                             "message": "Запись остановлена"
                         })
                         break
+                    elif message.get("type") == "clear":
+                        # Очищаем текст, но продолжаем запись
+                        if session_id in active_transcribers:
+                            session_state = active_transcribers[session_id]
+                            # Полностью сбрасываем состояние накопления
+                            session_state["full_text_state"] = {"full": "", "pending": ""}
+                            session_state["translated_text_state"] = {"full": "", "pending": ""}
+                            session_state["accumulated_text"] = []
+                            # Устанавливаем флаг очистки, чтобы text_callback знал, что нужно начинать с нуля
+                            session_state["text_cleared"] = True
+                        # Отправляем подтверждение очистки
+                        await websocket.send_json({
+                            "type": "cleared",
+                            "message": "Текст очищен"
+                        })
                 except asyncio.TimeoutError:
+                    # Отправляем ping для поддержания соединения
+                    try:
+                        await websocket.send_json({"type": "ping"})
+                    except:
+                        pass
                     # Проверяем, не остановлена ли уже запись
                     if session_id in active_transcribers:
                         transcriber = active_transcribers[session_id].get("transcriber")
@@ -415,18 +620,26 @@ async def websocket_transcribe(websocket: WebSocket, session_id: str):
                             break
                     continue
             except WebSocketDisconnect:
-                # Клиент отключился, останавливаем запись
+                # Клиент отключился, но НЕ останавливаем транскрибацию
+                # Транскрибация продолжается в фоне
+                print(f"WebSocket отключен для сессии {session_id}, транскрибация продолжается")
                 if session_id in active_transcribers:
-                    transcriber = active_transcribers[session_id].get("transcriber")
-                    if transcriber:
-                        transcriber.is_live_recording = False
+                    active_transcribers[session_id]["websocket"] = None
+                # Выходим из цикла ожидания сообщений, но транскрибация продолжается
                 break
             except Exception as e:
                 print(f"Ошибка получения сообщения: {e}")
+                # Не прерываем транскрибацию при ошибке получения сообщений
                 break
         
     except WebSocketDisconnect:
-        pass
+        # Клиент отключился, но НЕ останавливаем транскрибацию
+        # Состояние сохраняется, можно переподключиться
+        print(f"Клиент отключился для сессии {session_id}, транскрибация продолжается в фоне")
+        # НЕ удаляем сессию, чтобы можно было переподключиться
+        # Только помечаем, что WebSocket закрыт
+        if session_id in active_transcribers:
+            active_transcribers[session_id]["websocket"] = None
     except Exception as e:
         print(f"Ошибка WebSocket: {e}")
         try:
@@ -437,9 +650,8 @@ async def websocket_transcribe(websocket: WebSocket, session_id: str):
         except:
             pass
     finally:
-        # Очищаем сессию
-        if session_id in active_transcribers:
-            del active_transcribers[session_id]
+        # НЕ удаляем сессию при отключении - только при явной остановке
+        # Сессия будет удалена только когда транскрибация остановлена
         try:
             await websocket.close()
         except:
